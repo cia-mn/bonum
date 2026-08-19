@@ -2,12 +2,14 @@ package bonum
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -174,4 +176,100 @@ func TestItemAlwaysSendsRemark(t *testing.T) {
 	if err != nil || !strings.Contains(string(b), `"remark"`) {
 		t.Fatalf("remark must be present even when empty: %s %v", b, err)
 	}
+}
+
+// TestLiveQRSettlement is the ₮10 measurement. It raises a real QR, waits for a human to pay it,
+// and records what the gateway does. It asserts nothing — the "ANSWER:" lines are the deliverable.
+//
+// Two open questions, one run:
+//
+//   - Does QRInvoice's status flip to PAID? If yes, polling can settle QR payments and a project
+//     needs no webhook for them.
+//   - Does paying a QR fire the PAYMENT webhook? Watch the server log separately (nutag's
+//     BONUM_RECORD=1 prints every raw body it receives).
+//
+// Polling every 5s for 15 minutes also measures whether QRInvoice rate-limits under real use.
+//
+//	BONUM_LIVE=1 BONUM_ENV=production BONUM_APP_SECRET=... BONUM_TERMINAL_ID=... \
+//	  go test -run Live -v -timeout 20m
+func TestLiveQRSettlement(t *testing.T) {
+	if os.Getenv("BONUM_LIVE") != "1" {
+		t.Skip("BONUM_LIVE not set; this one moves real money")
+	}
+	sec, term := os.Getenv("BONUM_APP_SECRET"), os.Getenv("BONUM_TERMINAL_ID")
+	if sec == "" || term == "" {
+		t.Fatal("BONUM_APP_SECRET and BONUM_TERMINAL_ID are required")
+	}
+	base := Sandbox
+	if os.Getenv("BONUM_ENV") == "production" {
+		base = Production
+	}
+	amount := 10.0
+	if v := os.Getenv("BONUM_LIVE_AMOUNT"); v != "" {
+		fmt.Sscanf(v, "%f", &amount)
+	}
+
+	c := New(base, sec, term)
+	c.Lang = "mn"
+	ctx := context.Background()
+	txn := fmt.Sprintf("live-%d", time.Now().UnixNano())
+
+	qr, err := c.CreateQR(ctx, QRRequest{Amount: amount, TransactionID: txn, ExpiresIn: 900})
+	if err != nil {
+		t.Fatalf("CreateQR: %v", err)
+	}
+	t.Logf("invoice=%s transactionId=%s amount=%.2f", qr.InvoiceID, txn, amount)
+
+	// Write the PNG out so it can be scanned from a phone; deeplinks only help on the phone itself.
+	if qr.QRImage != "" {
+		raw := qr.QRImage
+		if i := strings.Index(raw, ","); strings.HasPrefix(raw, "data:") && i > 0 {
+			raw = raw[i+1:]
+		}
+		if png, err := base64.StdEncoding.DecodeString(raw); err == nil {
+			f := filepath.Join(os.TempDir(), txn+".png")
+			if os.WriteFile(f, png, 0o600) == nil {
+				t.Logf("scan this with a banking app: %s", f)
+			}
+		}
+	}
+	for _, l := range qr.Links {
+		t.Logf("  deeplink %-14s %s", l.Name, l.Link)
+	}
+
+	last := ""
+	for deadline := time.Now().Add(15 * time.Minute); time.Now().Before(deadline); time.Sleep(5 * time.Second) {
+		qi, err := c.QRInvoice(ctx, qr.QRCode)
+		if err != nil {
+			t.Logf("%s QRInvoice error: %v", time.Now().Format("15:04:05"), err)
+			continue
+		}
+		if qi.Invoice.Status == last {
+			continue
+		}
+		last = qi.Invoice.Status
+		t.Logf("%s status=%s amount=%.2f", time.Now().Format("15:04:05"), last, qi.Invoice.Amount)
+		if strings.EqualFold(last, "PAID") {
+			t.Log("ANSWER: QRInvoice flips to PAID — polling can settle QR payments")
+			break
+		}
+	}
+	if !strings.EqualFold(last, "PAID") {
+		t.Logf("ANSWER: status never reached PAID (last=%q) — polling cannot settle QR payments", last)
+	}
+
+	// The docs list Get Invoice Status, but the sandbox rejects it and production is untested. If it
+	// answers, the card checkout path becomes pollable too and webhooks turn fully optional.
+	// Take the path from the gateway docs; Do reaches anything this package does not wrap.
+	p := os.Getenv("BONUM_STATUS_PATH")
+	if p == "" {
+		t.Log("BONUM_STATUS_PATH unset — skipped the Get Invoice Status probe (path is in the gateway docs)")
+		return
+	}
+	var body json.RawMessage
+	if err := c.Do(ctx, "GET", p, nil, nil, &body); err != nil {
+		t.Logf("ANSWER: invoice-status probe %s failed: %v — card stays webhook-only", p, err)
+		return
+	}
+	t.Logf("ANSWER: invoice-status probe %s answered: %s — card is pollable too", p, body)
 }
