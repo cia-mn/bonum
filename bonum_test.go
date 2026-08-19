@@ -165,3 +165,13 @@ func TestSandbox(t *testing.T) {
 	}
 	t.Logf("ok: invoice=%s qr=%s tokenize=%s", inv.FollowUpLink, qr.InvoiceID, tok.FollowUpLink)
 }
+
+// The gateway builds each Item into a DTO whose remark is a non-nullable constructor parameter:
+// drop the key and the whole invoice 500s with "missing (therefore NULL) value for creator
+// parameter remark". An empty remark must still serialize.
+func TestItemAlwaysSendsRemark(t *testing.T) {
+	b, err := json.Marshal(Item{Title: "Americano", Amount: 5000, Count: 1})
+	if err != nil || !strings.Contains(string(b), `"remark"`) {
+		t.Fatalf("remark must be present even when empty: %s %v", b, err)
+	}
+}

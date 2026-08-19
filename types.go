@@ -26,10 +26,14 @@ type Provider struct {
 }
 
 // Item is a line shown on the checkout/tokenization page.
+//
+// Remark is always serialized, empty or not: the gateway builds each line into a DTO whose remark
+// is a non-nullable constructor parameter, so omitting the key fails the whole invoice with
+// "missing (therefore NULL) value for creator parameter remark". Image may be omitted.
 type Item struct {
 	Image  string  `json:"image,omitempty"`
 	Title  string  `json:"title"`
-	Remark string  `json:"remark,omitempty"`
+	Remark string  `json:"remark"`
 	Amount float64 `json:"amount"`
 	Count  int     `json:"count"`
 }
